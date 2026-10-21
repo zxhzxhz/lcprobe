@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build LCProbe.dylib
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -dynamiclib \
+            -O2 \
+            -fobjc-arc \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=16.0 \
+            -framework Foundation \
+            -framework IOKit \
+            -install_name @rpath/LCProbe.dylib \
+            -o LCProbe.dylib \
+            LCProbe.m
+          codesign -s - -f LCProbe.dylib
+          file LCProbe.dylib
+          otool -l LCProbe.dylib | grep -A4 LC_BUILD_VERSION || true
+          mkdir -p out
+          cp LCProbe.dylib out/
+          cd out && zip -9 ../LCProbe.zip LCProbe.dylib && cd ..
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LCProbe
+          path: LCProbe.zip
+          retention-days: 90
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete v1 --yes -R ${{ github.repository }} || true
+          gh release create v1 LCProbe.zip \
+            --repo ${{ github.repository }} \
+            --title "LCProbe v1" \
+            --notes "TXM / signed-code-page write probe for LiveContainer guest apps."
