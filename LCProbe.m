@@ -1,11 +1,15 @@
 //
-//  LCProbe.m  v5  -  TXM exec-permission policy probe
-//  v4 finding: anonymous page -> mach_vm_protect(RX) = OK, cur=r-x, max stays rwx.
-//              mprotect(RWX) on anon = accepted but cur stays rw- (X silently dropped).
-//  v5 asks: (a) does code written to an anonymous RX page actually EXECUTE?
-//           (b) can the signed __TEXT page be patched with a single RWX call?
-//  jit_bridge (brk #0xf00d) is now OPT-IN only: it hard-crashes the guest when the
-//  JIT script is not servicing it, which truncated the v4 run before T5.
+//  LCProbe.m  v6  -  FINAL open question on iOS 26/27 TXM
+//
+//  Established (v3/v5):
+//    T1  mprotect(RW) -> write -> mprotect(RX)   : RX returns EACCES(13), max stuck rw-
+//    T2  mach_vm_remap(FIXED|OVERWRITE) over __TEXT : KERN_PROTECTION_FAILURE(2)
+//    T3  anon page + mach_vm_protect(RX) = 0 but cur=r--, exec -> SIGBUS
+//
+//  Remaining: is the max_prot downgrade triggered by ASKING for W, or by WRITING?
+//    T5a  single-call mprotect(RWX) then write        <- decisive
+//    T5b  mprotect(RW) then mprotect(RWX) then write  <- control
+//  T3 is now opt-in (Documents/lcprobe_anonexec) so it can never mask T5.
 //
 
 #import <Foundation/Foundation.h>
@@ -34,9 +38,6 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 
 #ifndef VM_FLAGS_ANYWHERE
 #define VM_FLAGS_ANYWHERE 0x1
-#endif
-#ifndef VM_PROT_COPY
-#define VM_PROT_COPY 0x10
 #endif
 
 static int gFd = -1;
@@ -119,116 +120,93 @@ static void onSignal(int sig, siginfo_t *si, void *uctx) {
     signal(sig, SIG_DFL);
 }
 
-// ============ T3: anonymous executable page, and does it actually run? ============
-static void test_anon_exec(BOOL useMmap) {
-    lg(@"---- T3%s anon executable page (%@)", useMmap ? @"b" : @"a",
-       useMmap ? @"mmap MAP_ANON" : @"mach_vm_allocate");
-
-    mach_vm_address_t page = 0;
-    if (useMmap) {
-        void *m = mmap(NULL, gPS, PROT_READ | PROT_WRITE,
-                       MAP_ANON | MAP_PRIVATE, -1, 0);
-        if (m == MAP_FAILED) { lg(@"     mmap failed errno=%d", errno); return; }
-        page = (mach_vm_address_t)m;
-    } else {
-        if (mach_vm_allocate(mach_task_self(), &page, gPS, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
-            lg(@"     mach_vm_allocate failed"); return;
-        }
-    }
-    lg(@"     page=0x%llx %@", page, regionDesc(page));
-
-    // the exact stub the unlock tweaks use: mov w0,#1 ; ret
-    uint32_t stub[2] = { 0x52800020, 0xD65F03C0 };
-    memcpy((void *)(uintptr_t)page, stub, 8);
-    sys_icache_invalidate((void *)(uintptr_t)page, gPS);
-
-    kern_return_t kr = mach_vm_protect(mach_task_self(), page, gPS, false,
-                                       VM_PROT_READ | VM_PROT_EXECUTE);
-    lg(@"     mach_vm_protect(RX) -> %d %@", kr, regionDesc(page));
-    if (kr != KERN_SUCCESS) {
-        lg(@"     ==> anon RX denied, no JIT-free code page possible");
-        return;
-    }
-
-    lg(@"     calling stub at 0x%llx …", page);
-    typedef int (*fn_t)(void);
-    fn_t f = (fn_t)(uintptr_t)page;
-    int ret = f();
-    lg(@"     stub returned %d  %@", ret,
-       (ret == 1) ? @"<== ANON PAGE EXECUTED SUCCESSFULLY"
-                  : @"<== executed but wrong return");
-    lg(@"     ==> %@", (ret == 1)
-       ? @"PREDICTION D: JIT-free anon exec works -> trampoline pool viable"
-       : @"inconclusive");
-}
-
-// ============ T5: single-call RWX on the signed __TEXT page ============
-static void test_patch_rwx(mach_vm_address_t target, const char *label) {
+// ---------- T5a: single-call RWX, then write ----------
+static BOOL t5_singleRWX(mach_vm_address_t target, const char *label) {
     mach_vm_address_t page = pageOf(target);
     uint32_t off = (uint32_t)(target - page);
 
-    lg(@"---- T5 single-call RWX on the signed page @ %s", label);
+    lg(@"---- T5a SINGLE-CALL mprotect(RWX) @ %s", label);
     lg(@"     page=0x%llx off=0x%x BEFORE %@", page, off, regionDesc(page));
-
     uint32_t orig[2]; memcpy(orig, (const void *)(uintptr_t)(page + off), 8);
-    lg(@"     original bytes %08x %08x", orig[0], orig[1]);
+    lg(@"     original %08x %08x", orig[0], orig[1]);
 
     errno = 0;
     int r = mprotect((void *)(uintptr_t)page, gPS, PROT_READ | PROT_WRITE | PROT_EXEC);
-    lg(@"     mprotect(RWX)  -> %d (errno=%d %s) %@",
+    lg(@"     mprotect(RWX) -> %d (errno=%d %s)  AFTER-CALL %@",
        r, errno, strerror(errno), regionDesc(page));
 
     if (r != 0) {
-        kern_return_t kr = mach_vm_protect(mach_task_self(), page, gPS, false,
-                                          VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-        lg(@"     mach_vm_protect(RWX) -> %d (%s) %@", kr, mach_error_string(kr),
-           regionDesc(page));
-        if (kr != KERN_SUCCESS) {
-            lg(@"     ==> signed page refuses RWX: in-place patching is impossible");
-            return;
-        }
+        lg(@"     ==> REJECTED at the mprotect() call: no RWX request is honoured");
+        return NO;
     }
 
     uint32_t patch[2] = { 0x52800020, 0xD65F03C0 };
     memcpy((void *)(uintptr_t)(page + off), patch, 8);
     uint32_t rb[2]; memcpy(rb, (void *)(uintptr_t)(page + off), 8);
     sys_icache_invalidate((void *)(uintptr_t)page, gPS);
-    lg(@"     wrote 52800020 d65f03c0 -> %08x %08x %@", rb[0], rb[1],
-       (rb[0] == patch[0] && rb[1] == patch[1]) ? @"(PATCH LIVE)" : @"(WRITE FAILED)");
-    lg(@"     AFTER PATCH %@", regionDesc(page));
-    lg(@"     ==> if the guest stays alive and the feature is unlocked, RWX works.");
-    lg(@"         if it dies with CODESIGNING, TXM re-hashes the page at exec time.");
-}
-
-// ============ T6: mmap MAP_FIXED over the signed page ============
-static void test_mmap_fixed(mach_vm_address_t target, const char *label) {
-    mach_vm_address_t page = pageOf(target);
-    uint32_t off = (uint32_t)(target - page);
-    lg(@"---- T6 mmap(MAP_FIXED, RWX, ANON) over the signed page @ %s", label);
-    lg(@"     BEFORE %@", regionDesc(page));
-
-    void *snap = malloc(gPS);
-    if (!snap) { lg(@"     !! malloc failed"); return; }
-    memcpy(snap, (void *)(uintptr_t)page, gPS);
+    lg(@"     wrote %08x %08x / read %08x %08x  %@", patch[0], patch[1], rb[0], rb[1],
+       (rb[0] == patch[0] && rb[1] == patch[1]) ? @"(WRITE OK)" : @"(WRITE FAILED)");
+    lg(@"     AFTER-WRITE %@", regionDesc(page));
 
     errno = 0;
-    void *got = mmap((void *)(uintptr_t)page, gPS, PROT_READ | PROT_WRITE | PROT_EXEC,
-                     MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
-    lg(@"     mmap(MAP_FIXED) -> %p (errno=%d %s)", got, errno, strerror(errno));
-    if (got == MAP_FAILED) { free(snap); return; }
+    int r2 = mprotect((void *)(uintptr_t)page, gPS, PROT_READ | PROT_EXEC);
+    lg(@"     shrink to RX -> %d (errno=%d %s)  AFTER %@", r2, errno, strerror(errno),
+       regionDesc(page));
 
-    memcpy((void *)(uintptr_t)page, snap, gPS);
-    free(snap);
-    uint32_t patch[2] = { 0x52800020, 0xD65F03C0 };
-    memcpy((void *)(uintptr_t)(page + off), patch, 8);
-    sys_icache_invalidate((void *)(uintptr_t)page, gPS);
-    lg(@"     AFTER  %@", regionDesc(page));
-    lg(@"     ==> watch for CODESIGNING kill");
+    if (r != 0) return NO;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, gPS, false,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    lg(@"     mach_vm_protect(RWX) -> %d (%s) %@", kr, mach_error_string(kr), regionDesc(page));
+
+    lg(@"     ==> patch is LIVE. If the guest survives and the feature is unlocked,");
+    lg(@"         single-call RWX is the fix. A CODESIGNING kill means no.");
+    return YES;
 }
 
-__attribute__((naked, noinline))
-static void *jit_bridge(void *addr, size_t len) {
-    __asm__ __volatile__("mov x16, #1\n\t" "brk #0xf00d\n\t" "ret\n\t");
+// ---------- T5b: RW first (control), then W+X together ----------
+static void t5_splitRWX(mach_vm_address_t target, const char *label) {
+    mach_vm_address_t page = pageOf(target);
+    uint32_t off = (uint32_t)(target - page);
+
+    lg(@"---- T5b control: RW then RWX (two calls) @ %s", label);
+    lg(@"     BEFORE %@", regionDesc(page));
+
+    errno = 0;
+    int r1 = mprotect((void *)(uintptr_t)page, gPS, PROT_READ | PROT_WRITE);
+    lg(@"     mprotect(RW)  -> %d (errno=%d)  %@", r1, errno, regionDesc(page));
+
+    errno = 0;
+    int r2 = mprotect((void *)(uintptr_t)page, gPS, PROT_READ | PROT_WRITE | PROT_EXEC);
+    lg(@"     mprotect(RWX) -> %d (errno=%d)  %@", r2, errno, regionDesc(page));
+
+    uint32_t orig[2]; memcpy(orig, (const void *)(uintptr_t)(page + off), 8);
+    uint32_t patch[2] = { 0x52800020, 0xD65F03C0 };
+    memcpy((void *)(uintptr_t)(page + off), patch, 8);
+    uint32_t rb[2]; memcpy(rb, (void *)(uintptr_t)(page + off), 8);
+    sys_icache_invalidate((void *)(uintptr_t)page, gPS);
+    lg(@"     wrote %08x %08x / read %08x %08x", patch[0], patch[1], rb[0], rb[1]);
+    lg(@"     AFTER %@", regionDesc(page));
+    lg(@"     ==> if max already dropped to rw- here, the downgrade happens on the W REQUEST");
+    (void)orig;
+}
+
+// ---------- T3 (opt-in): anonymous page exec ----------
+static void t3_anonExec(void) {
+    lg(@"---- T3 (opt-in) anonymous page exec");
+    mach_vm_address_t page = 0;
+    if (mach_vm_allocate(mach_task_self(), &page, gPS, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+        lg(@"     alloc failed"); return;
+    }
+    uint32_t stub[2] = { 0x52800020, 0xD65F03C0 };
+    memcpy((void *)(uintptr_t)page, stub, 8);
+    sys_icache_invalidate((void *)(uintptr_t)page, gPS);
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page, gPS, false,
+                                       VM_PROT_READ | VM_PROT_EXECUTE);
+    lg(@"     page=0x%llx mach_vm_protect(RX) -> %d %@", page, kr, regionDesc(page));
+    lg(@"     calling … (SIGBUS here is the expected result on TXM)");
+    int (*f)(void) = (int (*)(void))(uintptr_t)page;
+    int ret = f();
+    lg(@"     returned %d", ret);
 }
 
 static uint64_t defaultRvaForPath(NSString *path) {
@@ -243,10 +221,6 @@ static void runTests(int attempt) {
     NSString *unityPath = nil;
     const struct mach_header_64 *unity = imageByName("UnityFramework", &unityPath);
     NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-    BOOL wantJit = [NSFileManager.defaultManager fileExistsAtPath:
-                    [docDir stringByAppendingPathComponent:@"lcprobe_jit"]];
-    BOOL wantMmapFixed = [NSFileManager.defaultManager fileExistsAtPath:
-                          [docDir stringByAppendingPathComponent:@"lcprobe_mmap"]];
 
     if (!unity) {
         if (attempt < 90) {
@@ -254,16 +228,14 @@ static void runTests(int attempt) {
                            dispatch_get_main_queue(), ^{ @autoreleasepool { runTests(attempt + 1); } });
             return;
         }
-        lg(@"!! UnityFramework never appeared");
-        return;
+        lg(@"!! UnityFramework never appeared"); return;
     }
 
     LCImage img;
     if (!describeImage(unity, &img)) { lg(@"!! cannot parse image"); return; }
     lg(@"--------------------------------------------------------");
     lg(@"image   : %@", unityPath);
-    lg(@"base=0x%llx total=0x%llx exec=+0x%llx/0x%llx", img.base, img.totalSize,
-       img.execOff, img.execVmsize);
+    lg(@"base=0x%llx exec=+0x%llx/0x%llx", img.base, img.execOff, img.execVmsize);
 
     uint64_t rvas[4] = {0,0,0,0}; int nRva = 0;
     NSString *cfgText = [NSString stringWithContentsOfFile:
@@ -281,46 +253,52 @@ static void runTests(int attempt) {
     }
     if (nRva == 0) {
         uint64_t d = defaultRvaForPath(unityPath);
-        if (d) { rvas[nRva++] = d; lg(@"targets: crashlog RVA 0x%llx", d); }
+        if (d) { rvas[nRva++] = d; }
         else { uint64_t mid = img.execOff + (img.execVmsize / 2);
-               rvas[nRva++] = (mid & ~(gPS - 1)) + 0x800; lg(@"targets: auto +0x%llx", rvas[0]); }
+               rvas[nRva++] = (mid & ~(gPS - 1)) + 0x800; }
     }
 
-    mach_vm_address_t tA = 0;
+    // two DISTINCT pages so T5a and T5b do not poison each other
+    mach_vm_address_t pages[4] = {0,0,0,0};
+    int nPage = 0;
     for (int i = 0; i < nRva; i++) {
         if (rvas[i] < img.execOff || rvas[i] >= img.execOff + img.execVmsize) {
-            lg(@"target[%d] rva 0x%llx outside exec seg", i, rvas[i]); continue; }
+            lg(@"target[%d] +0x%llx outside exec seg", i, rvas[i]); continue; }
         mach_vm_address_t a = img.base + rvas[i];
         lg(@"target[%d] +0x%llx -> 0x%llx %@", i, rvas[i], a, regionDesc(a));
-        uint32_t w[2]; memcpy(w, (const void *)(uintptr_t)a, 8);
-        lg(@"       bytes %08x %08x", w[0], w[1]);
-        if (!tA) tA = a;
+        BOOL dup = NO;
+        for (int k = 0; k < nPage; k++) if (pageOf(pages[k]) == pageOf(a)) dup = YES;
+        if (!dup && nPage < 4) pages[nPage++] = a;
+    }
+    if (nPage == 0) {
+        // fall back to a second page inside the segment
+        uint64_t q = (img.execOff + (img.execVmsize / 2)) & ~(gPS - 1);
+        pages[nPage++] = img.base + q + 0x800;
+        lg(@"fallback target 0x%llx %@", pages[0], regionDesc(pages[0]));
     }
     lg(@"--------------------------------------------------------");
 
-    // T3 first: the cheap, non-destructive question about code execution
-    test_anon_exec(NO);
-    test_anon_exec(YES);
+    // ---------- DECISIVE: T5a on the first page ----------
+    BOOL t5aOK = t5_singleRWX(pages[0], "page0");
 
-    if (!tA) { lg(@"!! no usable target, stopping"); goto done; }
-
-    if (wantMmapFixed) {
-        test_mmap_fixed(tA, "target0");
-        goto done;
+    // ---------- control: T5b on a second page (only if it exists) ----------
+    if (nPage > 1) {
+        t5_splitRWX(pages[1], "page1");
+    } else {
+        lg(@"---- T5b skipped (only one target page)");
+        lg(@"     create Documents/lcprobe_targets.txt with a second RVA to run it");
     }
 
-    test_patch_rwx(tA, "target0");
-
-    if (wantJit) {
-        lg(@"---- T7 jit_bridge (opt-in via Documents/lcprobe_jit)");
-        void *jit = jit_bridge(NULL, (size_t)gPS);
-        lg(@"     jit_bridge -> %p %@", jit,
-           jit ? regionDesc((mach_vm_address_t)jit) : @"(null)");
+    // ---------- opt-in extras ----------
+    if ([NSFileManager.defaultManager fileExistsAtPath:
+         [docDir stringByAppendingPathComponent:@"lcprobe_anonexec"]]) {
+        t3_anonExec();
+    } else {
+        lg(@"---- T3 skipped (create Documents/lcprobe_anonexec to run)");
     }
 
-done:
     lg(@"========================================================");
-    lg(@"probe done");
+    lg(@"VERDICT: T5a=%@", t5aOK ? @"RWX ACCEPTED" : @"RWX REJECTED");
     lg(@"========================================================");
     if (gFd >= 0) { close(gFd); gFd = -1; }
 }
@@ -341,7 +319,7 @@ static void LCProbeInit(void) {
         sigaction(SIGBUS,&sa,NULL); sigaction(SIGSEGV,&sa,NULL); sigaction(SIGILL,&sa,NULL);
 
         lg(@"========================================================");
-        lg(@"LCProbe v5  (TXM exec-permission policy)");
+        lg(@"LCProbe v6  (final: is the max_prot downgrade on W-request or on write?)");
         lg(@"========================================================");
         lg(@"os   : %@", NSProcessInfo.processInfo.operatingSystemVersionString);
         struct utsname u; if (uname(&u) == 0) lg(@"hw   : %s", u.machine);
