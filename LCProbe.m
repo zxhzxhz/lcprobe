@@ -364,9 +364,8 @@ static void dumpEnvironment(void) {
         const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
         LCImage info;
         if (describeImage(mh, &info)) {
-            lg(@"   [%2u] base=0x%llx size=0x%llx exec=%llu/0x%llx %s", i, info.base,
-               info.totalSize, (unsigned long long)info.execVmaddr, info.execVmsize,
-               p ? p : "?");
+            lg(@"   [%2u] base=0x%llx size=0x%llx exec=+0x%llx/0x%llx %s", i, info.base,
+               info.totalSize, info.execOff, info.execVmsize, p ? p : "?");
         } else {
             lg(@"   [%2u] <unparsed> %s", i, p ? p : "?");
         }
