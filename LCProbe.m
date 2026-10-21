@@ -5,26 +5,47 @@
 
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <mach/vm_region.h>
-#import <mach/vm_prot.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <libkern/OSCacheControl.h>
 #import <sys/mman.h>
 #import <sys/stat.h>
 #import <sys/fcntl.h>
+#import <sys/ucontext.h>
+#import <sys/utsname.h>
 #import <signal.h>
 #import <unistd.h>
 #import <errno.h>
-#import <IOKit/IOKitLib.h>
 #include <stdarg.h>
 #include <string.h>
 
+// The iOS SDK ships mach/mach_vm.h as a stub that #errors out. Declare what we need.
+extern kern_return_t mach_vm_allocate(vm_map_t, mach_vm_address_t *, mach_vm_size_t, int);
+extern kern_return_t mach_vm_deallocate(vm_map_t, mach_vm_address_t, mach_vm_size_t);
+extern kern_return_t mach_vm_protect(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t);
+extern kern_return_t mach_vm_remap(vm_map_t, mach_vm_address_t *, mach_vm_size_t, mach_vm_offset_t,
+                                   int, vm_map_t, mach_vm_address_t, boolean_t,
+                                   vm_prot_t *, vm_prot_t *, vm_inherit_t);
+extern kern_return_t mach_vm_region_recurse(vm_map_t, mach_vm_address_t *, mach_vm_size_t *, natural_t *,
+                                            vm_region_recurse_info_t, mach_msg_type_number_t *);
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+
+#ifndef VM_FLAGS_FIXED
+#define VM_FLAGS_FIXED 0x0
+#endif
+#ifndef VM_FLAGS_ANYWHERE
+#define VM_FLAGS_ANYWHERE 0x1
+#endif
+#ifndef VM_FLAGS_OVERWRITE
+#define VM_FLAGS_OVERWRITE 0x4000
+#endif
+#ifndef VM_PROT_COPY
+#define VM_PROT_COPY 0x10
+#endif
+
 static int gFd = -1;
 static uint64_t gPS = 0;
-
-extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 
 #pragma mark - logging (fd stays open so a fatal crash still leaves the log)
 
@@ -111,8 +132,6 @@ static void *jit_bridge(void *addr, size_t len) {
 
 #pragma mark - signal fallback (skips a brk that no JIT script is servicing)
 
-static char gAltStack[64 * 1024];
-
 static void onSignal(int sig, siginfo_t *si, void *uctx) {
     ucontext_t *uc = (ucontext_t *)uctx;
     uint64_t pc = 0;
@@ -147,7 +166,7 @@ static void test_naive_inplace(mach_vm_address_t target, const char *label) {
 
     lg(@"---- T1 naive in-place patch @ %s", label);
     lg(@"     target=0x%llx page=0x%llx off=0x%x", target, page, off);
-    lg(@"     BEFORE  %s", regionDesc(page));
+    lg(@"     BEFORE  %@", regionDesc(page));
 
     errno = 0;
     int r1 = mprotect((void *)(uintptr_t)page, gPS, PROT_READ | PROT_WRITE);
@@ -156,7 +175,7 @@ static void test_naive_inplace(mach_vm_address_t target, const char *label) {
     kern_return_t kr_rw = mach_vm_protect(mach_task_self(), page, gPS, false,
                                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     lg(@"     mach_vm_protect(RW|COPY) -> %d (%s)", kr_rw, mach_error_string(kr_rw));
-    lg(@"     AFTER-W %s", regionDesc(page));
+    lg(@"     AFTER-W %@", regionDesc(page));
 
     if (r1 == 0 || kr_rw == KERN_SUCCESS) {
         uintptr_t dst = (uintptr_t)(page + off);
@@ -166,12 +185,12 @@ static void test_naive_inplace(mach_vm_address_t target, const char *label) {
         memcpy((void *)dst, &nop, 4);
         uint32_t readback;
         memcpy(&readback, (void *)dst, 4);
-        lg(@"     wrote NOP @+0x%x readback=0x%08x %s", off, readback,
+        lg(@"     wrote NOP @+0x%x readback=0x%08x %@", off, readback,
            readback == nop ? @"(WRITE OK)" : @"(WRITE MISMATCH)");
-        memcpy((void *)dst, &orig, 4);   // restore original bytes so the hash stays valid
+        memcpy((void *)dst, &orig, 4);
         uint32_t restored;
         memcpy(&restored, (void *)dst, 4);
-        lg(@"     restored readback=0x%08x %s", restored,
+        lg(@"     restored readback=0x%08x %@", restored,
            restored == orig ? @"(CONTENT INTACT)" : @"(RESTORE FAILED)");
     } else {
         lg(@"     !! page never became writable, skipping the write step");
@@ -187,8 +206,8 @@ static void test_naive_inplace(mach_vm_address_t target, const char *label) {
                              VM_PROT_READ | VM_PROT_EXECUTE);
         lg(@"     mach_vm_protect(RX)      -> %d (%s)", kr, mach_error_string(kr));
     }
-    lg(@"     AFTER   %s", regionDesc(page));
-    lg(@"     ==> %s", (r2 == 0) ? @"X RESTORED (naive hook viable here)"
+    lg(@"     AFTER   %@", regionDesc(page));
+    lg(@"     ==> %@", (r2 == 0) ? @"X RESTORED (naive hook viable here)"
                                  : @"X LOST  <== root cause of the SIGBUS confirmed");
 }
 
@@ -203,8 +222,8 @@ static void test_remap(mach_vm_address_t target, mach_vm_address_t srcPage,
 
     lg(@"---- %s remap-overwrite @ %s", srcKind, label);
     lg(@"     target=0x%llx page=0x%llx src=0x%llx", target, page, srcPage);
-    lg(@"     BEFORE  %s", regionDesc(page));
-    lg(@"     src     %s", regionDesc(srcPage));
+    lg(@"     BEFORE  %@", regionDesc(page));
+    lg(@"     src     %@", regionDesc(srcPage));
 
     kern_return_t krw = mach_vm_protect(mach_task_self(), srcPage, gPS, false,
                                         VM_PROT_READ | VM_PROT_WRITE);
@@ -223,12 +242,12 @@ static void test_remap(mach_vm_address_t target, mach_vm_address_t srcPage,
     memcpy((void *)(uintptr_t)(srcPage + off), &nop, 4);
     uint32_t chk;
     memcpy(&chk, (void *)(uintptr_t)(srcPage + off), 4);
-    lg(@"     patched src +0x%x = 0x%08x %s", off, chk, chk == nop ? @"OK" : @"MISMATCH");
+    lg(@"     patched src +0x%x = 0x%08x %@", off, chk, chk == nop ? @"OK" : @"MISMATCH");
 
     kern_return_t krx = mach_vm_protect(mach_task_self(), srcPage, gPS, false,
                                         VM_PROT_READ | VM_PROT_EXECUTE);
     lg(@"     src -> RX                -> %d (%s)", krx, mach_error_string(krx));
-    lg(@"     src after RX %s", regionDesc(srcPage));
+    lg(@"     src after RX %@", regionDesc(srcPage));
     sys_icache_invalidate((void *)(uintptr_t)srcPage, gPS);
 
     mach_vm_address_t dst = page;
@@ -236,18 +255,18 @@ static void test_remap(mach_vm_address_t target, mach_vm_address_t srcPage,
                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
                        mach_task_self(), srcPage, TRUE,
                        &cur, &mx, VM_INHERIT_COPY);
-    lg(@"     *** mach_vm_remap(FIXED|OVERWRITE) -> %d (%s) cur=%s max=%s",
-       kr, mach_error_string(kr), protStr(cur).UTF8String, protStr(mx).UTF8String);
+    lg(@"     *** mach_vm_remap(FIXED|OVERWRITE) -> %d (%s) cur=%@ max=%@",
+       kr, mach_error_string(kr), protStr(cur), protStr(mx));
 
     if (kr != KERN_SUCCESS) {
         lg(@"     ==> prediction A: kernel refuses to overwrite a signed code page");
         return;
     }
 
-    lg(@"     AFTER   %s", regionDesc(page));
+    lg(@"     AFTER   %@", regionDesc(page));
     uint32_t got;
     memcpy(&got, (void *)(uintptr_t)(page + off), 4);
-    lg(@"     readback page+0x%x = 0x%08x %s", off, got,
+    lg(@"     readback page+0x%x = 0x%08x %@", off, got,
        got == nop ? @"(PATCH LIVE)" : @"(UNEXPECTED CONTENT)");
     lg(@"     ==> remap ACCEPTED: now watch for a delayed CODESIGNING kill");
 
@@ -259,19 +278,16 @@ static void test_remap(mach_vm_address_t target, mach_vm_address_t srcPage,
         int rr2 = mprotect((void *)(uintptr_t)page, gPS, PROT_READ | PROT_EXEC);
         lg(@"     re-patch mprotect(RX)    -> %d (errno=%d %s)", rr2, errno, strerror(errno));
     }
-    lg(@"     AFTER-REPATCH %s", regionDesc(page));
+    lg(@"     AFTER-REPATCH %@", regionDesc(page));
     sys_icache_invalidate((void *)(uintptr_t)page, gPS);
 }
 
 #pragma mark - environment
 
-static BOOL hasTXM(void) {
-    io_registry_entry_t mm = IORegistryEntryFromPath(0, "IODeviceTree:/chosen/memory-map");
-    if (mm == IO_OBJECT_NULL) return NO;
-    NSArray *keys = (__bridge_transfer NSArray *)IORegistryEntryCreateCFProperty(
-        mm, CFSTR(kIORegistryEntryPropertyKeysKey), 0, 0);
-    IOObjectRelease(mm);
-    return keys && [keys containsObject:@"TXM"];
+static NSString *hardwareID(void) {
+    struct utsname u;
+    if (uname(&u) != 0) return @"?";
+    return @(u.machine);
 }
 
 static void dumpEnvironment(void) {
@@ -279,9 +295,9 @@ static void dumpEnvironment(void) {
     lg(@"LCProbe  (TXM / signed-code-page diagnostic)");
     lg(@"========================================================");
     lg(@"os      : %@", NSProcessInfo.processInfo.operatingSystemVersionString);
+    lg(@"hw      : %@", hardwareID());
     lg(@"pid     : %d   pagesize=0x%llx", getpid(), gPS);
     lg(@"HOME    : %s", getenv("HOME") ?: "(null)");
-    lg(@"TXM key : %@", hasTXM() ? @"PRESENT (codeSigningMonitor expected = 2)" : @"absent");
 
     uint32_t flags = 0;
     if (csops(getpid(), 0, &flags, sizeof(flags)) == 0) {
@@ -300,6 +316,85 @@ static void dumpEnvironment(void) {
         const char *p = _dyld_get_image_name(i);
         lg(@"   [%2u] %s", i, p ? p : "?");
     }
+}
+
+#pragma mark - tests driver
+
+static void runTests(void) {
+    const uint64_t offsets[3] = { 0x15a6b8cULL, 0x41771f8ULL, 0x14a78e4ULL };
+    const char *names[3] = { "unity+0x15a6b8c(ohgihime)",
+                             "unity+0x41771f8(kamitsubaki)",
+                             "unity+0x14a78e4(dynamix)" };
+
+    NSString *unityPath = nil;
+    const struct mach_header_64 *unity = findImage("UnityFramework", &unityPath);
+    if (unity) {
+        lg(@"UnityFramework base=0x%llx size=0x%llx",
+           (uint64_t)(uintptr_t)unity, imageVMSize(unity));
+    } else {
+        lg(@"UnityFramework not loaded -> fallback to the main image");
+        unity = findImage("/LiveContainer", &unityPath);
+    }
+    if (!unity) {
+        lg(@"!! no usable image, aborting");
+        return;
+    }
+
+    uint64_t base = (uint64_t)(uintptr_t)unity;
+    uint64_t size = imageVMSize(unity);
+
+    mach_vm_address_t targets[3] = {0};
+    for (int i = 0; i < 3; i++) {
+        if (offsets[i] < size) {
+            targets[i] = (mach_vm_address_t)(base + offsets[i]);
+            lg(@"target[%d] %s -> 0x%llx %@", i, names[i], targets[i],
+               regionDesc(targets[i]));
+        } else {
+            lg(@"target[%d] %s -> outside image (size=0x%llx), skipped",
+               i, names[i], size);
+        }
+    }
+
+    // T2 first: anon-source remap is the cleanest read on kernel policy
+    if (targets[1]) {
+        mach_vm_address_t anonSrc = 0;
+        kern_return_t kr = mach_vm_allocate(mach_task_self(), &anonSrc, gPS, VM_FLAGS_ANYWHERE);
+        if (kr == KERN_SUCCESS) {
+            lg(@"anon source page = 0x%llx %@", anonSrc, regionDesc(anonSrc));
+            test_remap(targets[1], anonSrc, names[1], "T2 anon");
+            mach_vm_deallocate(mach_task_self(), anonSrc, gPS);
+        } else {
+            lg(@"!! mach_vm_allocate failed: %d", kr);
+        }
+    }
+
+    // T3: same but the source page comes from the JIT bridge
+    NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *marker = [docDir stringByAppendingPathComponent:@"lcprobe_jit"];
+    if (targets[2] && [NSFileManager.defaultManager fileExistsAtPath:marker]) {
+        lg(@"---- T3 JIT page acquisition via brk #0xf00d");
+        void *jit = jit_bridge(NULL, (size_t)gPS);
+        lg(@"     jit_bridge(NULL,0x%llx) -> %p", gPS, jit);
+        if (jit) {
+            lg(@"     jit page %@", regionDesc((mach_vm_address_t)jit));
+            test_remap(targets[2], (mach_vm_address_t)jit, names[2], "T3 jit");
+        } else {
+            lg(@"     !! no JIT page (universal.js loop is not servicing brk #0xf00d)");
+        }
+    } else if (targets[2]) {
+        lg(@"---- T3 skipped (create Documents/lcprobe_jit to enable)");
+    }
+
+    // T1 last: it can leave the page non-executable and kill the app afterwards
+    if (targets[0]) {
+        test_naive_inplace(targets[0], names[0]);
+    }
+
+    lg(@"========================================================");
+    lg(@"probe finished. A crash right after this line is the delayed");
+    lg(@"consequence of T1 (page left without execute permission).");
+    lg(@"========================================================");
+    if (gFd >= 0) { close(gFd); gFd = -1; }
 }
 
 #pragma mark - entry
@@ -332,76 +427,9 @@ static void LCProbeInit(void) {
         dumpEnvironment();
         lg(@"result  : %@", outPath);
 
-        const uint64_t offsets[3] = { 0x15a6b8cULL, 0x41771f8ULL, 0x14a78e4ULL };
-        const char *names[3] = { "unity+0x15a6b8c(ohgihime)",
-                                 "unity+0x41771f8(kamitsubaki)",
-                                 "unity+0x14a78e4(dynamix)" };
-
-        NSString *unityPath = nil;
-        const struct mach_header_64 *unity = findImage("UnityFramework", &unityPath);
-        if (unity) {
-            lg(@"UnityFramework base=0x%llx size=0x%llx",
-               (uint64_t)(uintptr_t)unity, imageVMSize(unity));
-        } else {
-            lg(@"UnityFramework not loaded -> fallback to main image");
-            unity = findImage("/LiveContainer", &unityPath);
-        }
-        if (!unity) {
-            lg(@"!! no usable image, aborting");
-            return;
-        }
-
-        uint64_t base = (uint64_t)(uintptr_t)unity;
-        uint64_t size = imageVMSize(unity);
-
-        mach_vm_address_t targets[3] = {0};
-        for (int i = 0; i < 3; i++) {
-            if (offsets[i] < size) {
-                targets[i] = (mach_vm_address_t)(base + offsets[i]);
-                lg(@"target[%d] %s -> 0x%llx %s", i, names[i], targets[i],
-                   regionDesc(targets[i]).UTF8String);
-            } else {
-                lg(@"target[%d] %s -> outside image (size=0x%llx), skipped",
-                   i, names[i], size);
-            }
-        }
-
-        if (targets[0]) {
-            test_naive_inplace(targets[0], names[0]);
-        }
-
-        if (targets[1]) {
-            mach_vm_address_t anonSrc = 0;
-            kern_return_t kr = mach_vm_allocate(mach_task_self(), &anonSrc, gPS,
-                                                VM_FLAGS_ANYWHERE);
-            if (kr == KERN_SUCCESS) {
-                lg(@"anon source page = 0x%llx %s", anonSrc,
-                   regionDesc(anonSrc).UTF8String);
-                test_remap(targets[1], anonSrc, names[1], "T2 anon");
-            } else {
-                lg(@"!! mach_vm_allocate failed: %d", kr);
-            }
-        }
-
-        NSString *marker = [docDir stringByAppendingPathComponent:@"lcprobe_jit"];
-        if (targets[2] && [NSFileManager.defaultManager fileExistsAtPath:marker]) {
-            lg(@"---- T3 JIT page acquisition via brk #0xf00d");
-            void *jit = jit_bridge(NULL, (size_t)gPS);
-            lg(@"     jit_bridge(NULL,0x%llx) -> %p", gPS, jit);
-            if (jit) {
-                lg(@"     jit page %s", regionDesc((mach_vm_address_t)jit).UTF8String);
-                test_remap(targets[2], (mach_vm_address_t)jit, names[2], "T3 jit");
-            } else {
-                lg(@"     !! no JIT page (universal.js loop is not servicing brk #0xf00d)");
-            }
-        } else if (targets[2]) {
-            lg(@"---- T3 skipped (create Documents/lcprobe_jit to enable)");
-        }
-
-        lg(@"========================================================");
-        lg(@"probe finished. If the app dies right after this line, the");
-        lg(@"crash is the delayed consequence of T1 (page left non-exec).");
-        lg(@"========================================================");
-        if (gFd >= 0) close(gFd);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @autoreleasepool { runTests(); }
+        });
     }
 }
