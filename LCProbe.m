@@ -100,10 +100,11 @@ static uint64_t pageOf(uint64_t a) { return a & ~(gPS - 1); }
 
 typedef struct {
     const struct mach_header_64 *mh;
-    uint64_t base;        // runtime address of the Mach-O header
+    uint64_t base;        // runtime address of the Mach-O header == load address
+    uint64_t minVmaddr;   // lowest segment vmaddr
     uint64_t slide;       // base - minVmaddr
-    uint64_t totalSize;   // end - minVmaddr  (pure vmaddr math, no pointer mixing)
-    uint64_t execVmaddr;  // first executable segment
+    uint64_t totalSize;   // maxVmaddrEnd - minVmaddr
+    uint64_t execOff;     // exec segment start, BASE-RELATIVE (crashlog imageOffset space)
     uint64_t execVmsize;
     uint64_t execFileoff;
 } LCImage;
@@ -128,6 +129,7 @@ static BOOL describeImage(const struct mach_header_64 *mh, LCImage *out) {
     out->base = (uint64_t)(uintptr_t)mh;
 
     uint64_t minVm = UINT64_MAX, maxEnd = 0;
+    uint64_t execVm = 0, execSize = 0, execFile = 0;
     const uint8_t *p = (const uint8_t *)(mh + 1);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)p;
@@ -136,17 +138,21 @@ static BOOL describeImage(const struct mach_header_64 *mh, LCImage *out) {
             if (seg->vmsize == 0) { p += lc->cmdsize; continue; }
             if (seg->vmaddr < minVm) minVm = seg->vmaddr;
             if (seg->vmaddr + seg->vmsize > maxEnd) maxEnd = seg->vmaddr + seg->vmsize;
-            if ((seg->initprot & VM_PROT_EXECUTE) && out->execVmsize == 0) {
-                out->execVmaddr = seg->vmaddr;
-                out->execVmsize = seg->vmsize;
-                out->execFileoff = seg->fileoff;
+            if ((seg->initprot & VM_PROT_EXECUTE) && execSize == 0) {
+                execVm = seg->vmaddr;
+                execSize = seg->vmsize;
+                execFile = seg->fileoff;
             }
         }
         p += lc->cmdsize;
     }
     if (minVm == UINT64_MAX || maxEnd <= minVm) return NO;
+    out->minVmaddr = minVm;
     out->totalSize = maxEnd - minVm;
     out->slide = out->base - minVm;
+    out->execOff = execVm - minVm;      // convert to base-relative space
+    out->execVmsize = execSize;
+    out->execFileoff = execFile;
     return YES;
 }
 
@@ -369,21 +375,32 @@ static void dumpEnvironment(void) {
 
 #pragma mark - driver
 
+// rva is BASE-RELATIVE, i.e. exactly the "imageOffset" column of an .ips crash log.
 static mach_vm_address_t pickTarget(LCImage *img, uint64_t rva, NSString **why) {
-    if (rva == 0) {
-        // middle of the first executable segment, away from headers and page edges
-        uint64_t mid = img->execVmaddr + (img->execVmsize / 2);
-        mid &= ~0x3ULL;
-        *why = [NSString stringWithFormat:@"auto exec-seg middle +0x%llx", mid - img->execVmaddr];
-        return img->slide + mid;
+    if (rva < img->execOff || rva >= img->execOff + img->execVmsize) {
+        *why = [NSString stringWithFormat:
+                @"rva 0x%llx outside exec seg [0x%llx,0x%llx)",
+                rva, img->execOff, img->execOff + img->execVmsize];
+        return 0;
     }
-    if (rva >= img->execVmaddr && rva < img->execVmaddr + img->execVmsize) {
-        *why = [NSString stringWithFormat:@"rva 0x%llx inside exec seg", rva];
-        return img->slide + rva;
-    }
-    *why = [NSString stringWithFormat:@"rva 0x%llx outside exec seg [0x%llx,0x%llx)",
-           rva, img->execVmaddr, img->execVmaddr + img->execVmsize];
-    return 0;
+    *why = [NSString stringWithFormat:@"rva 0x%llx inside exec seg", rva];
+    return img->base + rva;
+}
+
+static void dumpTargetBytes(mach_vm_address_t addr, uint64_t rva) {
+    if ((addr & 0xFFF) > 0xFF0) return;
+    uint32_t w[4] = {0};
+    memcpy(w, (const void *)(uintptr_t)addr, sizeof(w));
+    lg(@"       bytes @+0x%llx: %08x %08x %08x %08x", rva, w[0], w[1], w[2], w[3]);
+    const char *kind = "unknown";
+    uint32_t a = w[0];
+    if ((a & 0xFFC07FFF) == 0xA9807BFD || (a & 0xFFC07FFF) == 0xA9007BFD) kind = "stp x29,x30,... (prologue)";
+    else if ((a & 0xFFC003FF) == 0xD10003FF) kind = "sub sp,sp,#imm (prologue)";
+    else if ((a & 0xFFFFFFE0) == 0xA9BF7BE0) kind = "pacibsp (prologue)";
+    else if ((a & 0xFF9FFC1F) == 0xF81F0FFE) kind = "str x30,[sp,#-imm]! (prologue)";
+    else if ((a & 0xFC000000) == 0x14000000) kind = "b <branch> (chained/patch)";
+    else if ((a & 0xFFE0001F) == 0xD4200000) kind = "brk #imm";
+    lg(@"       heuristic: %s", kind);
 }
 
 static void runTests(void) {
@@ -414,54 +431,78 @@ static void runTests(void) {
     lg(@"image   : %@", unityPath);
     lg(@"index   : %d  base=0x%llx slide=0x%llx totalSize=0x%llx", unityIdx, img.base,
        img.slide, img.totalSize);
-    lg(@"exec seg: vmaddr=0x%llx vmsize=0x%llx fileoff=0x%llx", img.execVmaddr,
+    lg(@"exec seg: base-rel 0x%llx vmsize=0x%llx fileoff=0x%llx", img.execOff,
        img.execVmsize, img.execFileoff);
     lg(@"--------------------------------------------------------");
 
     if (img.execVmsize == 0) { lg(@"!! image has no executable segment, abort"); return; }
 
-    // optional user-supplied RVAs: Documents/lcprobe_targets.txt, one hex rva per line
+    // Requested targets, BASE-RELATIVE (same space as an .ips "imageOffset").
+    // Sources, in order: Documents/lcprobe_targets.txt, else the auto pick.
     uint64_t rvas[4] = {0, 0, 0, 0};
+    int nRva = 0;
     NSString *cfg = [docDir stringByAppendingPathComponent:@"lcprobe_targets.txt"];
     NSString *cfgText = [NSString stringWithContentsOfFile:cfg encoding:NSUTF8StringEncoding error:nil];
     if (cfgText.length) {
-        NSArray *lines = [cfgText componentsSeparatedByString:@"\n"];
-        int k = 0;
-        for (NSString *raw in lines) {
-            NSString *t = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-            if (t.length == 0 || [t hasPrefix:@"#"] || k >= 4) continue;
+        for (NSString *raw in [cfgText componentsSeparatedByString:@"\n"]) {
+            NSString *t = [raw stringByTrimmingCharactersInSet:
+                           NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (t.length == 0 || [t hasPrefix:@"#"] || nRva >= 4) continue;
             if ([t hasPrefix:@"0x"] || [t hasPrefix:@"0X"]) t = [t substringFromIndex:2];
-            rvas[k] = strtoull(t.UTF8String, NULL, 16);
-            k++;
+            uint64_t v = strtoull(t.UTF8String, NULL, 16);
+            if (v) { rvas[nRva++] = v; }
         }
-        lg(@"targets file: %d rva(s) loaded from %@", k, cfg.lastPathComponent);
+        lg(@"targets file: %d rva(s) from %@", nRva, cfg.lastPathComponent);
+    }
+
+    if (nRva == 0) {
+        // auto: two points inside the exec segment, page-aligned to distinct pages
+        uint64_t mid = img.execOff + (img.execVmsize / 2);
+        mid &= ~(gPS - 1);
+        mid += 0x800;                       // middle of that page
+        rvas[0] = mid; rvas[1] = 0; nRva = 1;
+        if (img.execVmsize > gPS * 4) {
+            uint64_t q = img.execOff + (img.execVmsize / 4);
+            q &= ~(gPS - 1);
+            q += 0x800;
+            if (q != mid) { rvas[1] = q; nRva = 2; }
+        }
+        lg(@"no targets file -> auto targets +0x%llx,+0x%llx", rvas[0], rvas[1]);
     }
 
     mach_vm_address_t targets[4] = {0};
-    NSString *why[4] = {nil, nil, nil, nil};
     const char *labels[4] = { "target0", "target1", "target2", "target3" };
-    for (int i = 0; i < 4; i++) {
-        if (i > 0 && rvas[i] == 0 && rvas[0] == 0) break;
-        if (i > 0 && rvas[i] == 0) break;
+    int nTarget = 0;
+    for (int i = 0; i < nRva; i++) {
         NSString *w = nil;
-        targets[i] = pickTarget(&img, rvas[i], &w);
-        why[i] = w;
-        if (targets[i]) {
-            lg(@"target[%d] %@ -> 0x%llx  %@  %@", i, why[i], targets[i],
-               regionDesc(targets[i]), @"");
+        mach_vm_address_t a = pickTarget(&img, rvas[i], &w);
+        if (a) {
+            targets[i] = a;
+            nTarget++;
+            lg(@"target[%d] %@ -> 0x%llx %@", i, w, a, regionDesc(a));
+            dumpTargetBytes(a, rvas[i]);
         } else {
-            lg(@"target[%d] skipped: %@", i, why[i]);
+            lg(@"target[%d] skipped: %@", i, w);
         }
     }
-    if (targets[0] == 0 && targets[1] == 0) {
-        lg(@"!! no usable target: exec segment is %.0f MB but requested RVAs are outside it",
-           img.execVmsize / 1048576.0);
-        lg(@"   put one hex RVA per line into Documents/lcprobe_targets.txt and relaunch");
+
+    if (nTarget == 0) {
+        lg(@"!! no usable target: exec segment is 0x%llx bytes starting at +0x%llx",
+           img.execVmsize, img.execOff);
+        lg(@"   write one hex BASE-RELATIVE offset per line into");
+        lg(@"   Documents/lcprobe_targets.txt and relaunch");
         return;
     }
 
-    mach_vm_address_t tA = targets[0] ?: targets[1];
-    mach_vm_address_t tB = targets[1] ?: targets[0];
+    // compact the survivors so tA/tB are always valid
+    mach_vm_address_t tA = 0, tB = 0;
+    for (int i = 0; i < nRva; i++) {
+        if (!targets[i]) continue;
+        if (!tA) { tA = targets[i]; }
+        else if (!tB) { tB = targets[i]; }
+    }
+
+    lg(@"selected tA=0x%llx tB=0x%llx", tA, tB);
 
     // ---- T2 first: non-destructive anon-source remap
     mach_vm_address_t anonSrc = 0;
